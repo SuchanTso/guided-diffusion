@@ -6,7 +6,72 @@ import blobfile as bf
 from mpi4py import MPI
 import numpy as np
 from torch.utils.data import DataLoader, Dataset
+from guided_diffusion import logger
+import torch 
 
+
+def load_data_for_reverse(
+    *,
+    data_dir,
+    batch_size,
+    image_size,
+    class_cond=False,
+    deterministic=True,
+    random_crop=False,
+    random_flip=False,
+):
+    """
+    For a dataset, create a generator over (images, kwargs) pairs.
+
+    Each images is an NCHW float tensor, and the kwargs dict contains zero or
+    more keys, each of which map to a batched Tensor of their own.
+    The kwargs dict can be used for class labels, in which case the key is "y"
+    and the values are integer tensors of class labels. # kwargs包含了标签信息
+
+    :param data_dir: a dataset directory.
+    :param batch_size: the batch size of each returned pair.
+    :param image_size: the size to which images are resized.
+    :param class_cond: if True, include a "y" key in returned dicts for class
+                       label. If classes are not available and this is true, an
+                       exception will be raised.
+    :param deterministic: if True, yield results in a deterministic order.
+    :param random_crop: if True, randomly crop the images for augmentation.
+    :param random_flip: if True, randomly flip the images for augmentation.
+    """
+    if not data_dir:
+        raise ValueError("unspecified data directory")
+    if MPI.COMM_WORLD.Get_rank() == 0:
+        all_files = _list_image_files_recursively(data_dir)
+
+    if MPI.COMM_WORLD.Get_rank() == 0:
+        MPI.COMM_WORLD.bcast(all_files)
+    else:
+        all_files = MPI.COMM_WORLD.bcast(None)
+
+    classes = None
+    if class_cond:
+        # Assume classes are the first part of the filename,
+        # before an underscore.
+        class_names = [bf.basename(path).split("_")[0] for path in all_files]  # 标签_文件名
+        sorted_classes = {x: i for i, x in enumerate(sorted(set(class_names)))}
+        classes = [sorted_classes[x] for x in class_names]
+    dataset = ImageDataset_for_reverse(
+        image_size,
+        all_files,
+        classes=classes,
+        shard=MPI.COMM_WORLD.Get_rank(),
+        num_shards=MPI.COMM_WORLD.Get_size(),
+        random_crop=random_crop,
+        random_flip=random_flip,
+    )
+    logger.log("MPI.COMM_WORLD.size: {}".format(MPI.COMM_WORLD.size))
+    logger.log("dataset length: {}".format(dataset.__len__() * MPI.COMM_WORLD.size))
+    if deterministic:
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=1, drop_last=False)
+    else:
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=1, drop_last=True)
+    while True:
+        yield from loader
 
 def load_data(
     *,
@@ -78,6 +143,49 @@ def _list_image_files_recursively(data_dir):
             results.extend(_list_image_files_recursively(full_path))
     return results
 
+class ImageDataset_for_reverse(Dataset):
+    def __init__(
+        self,
+        resolution,
+        image_paths,
+        classes=None,
+        shard=0,
+        num_shards=1,
+        random_crop=False,
+        random_flip=True,
+    ):
+        super().__init__()
+        self.resolution = resolution
+        self.local_images = image_paths[shard:][::num_shards]
+        self.local_classes = None if classes is None else classes[shard:][::num_shards]
+        self.random_crop = random_crop
+        self.random_flip = random_flip
+
+    def __len__(self):
+        return len(self.local_images)
+
+    def __getitem__(self, idx):
+        path = self.local_images[idx]
+        with bf.BlobFile(path, "rb") as f:
+            pil_image = Image.open(f)
+            pil_image.load()
+        pil_image = pil_image.convert("RGB")
+
+        if self.random_crop:
+            arr = random_crop_arr(pil_image, self.resolution)
+        else:
+            arr = center_crop_arr(pil_image, self.resolution)
+
+        if self.random_flip and random.random() < 0.5:
+            arr = arr[:, ::-1]
+
+        arr = arr.astype(np.float32) / 127.5 - 1
+
+        out_dict = {}
+        if self.local_classes is not None:
+            out_dict["y"] = np.array(self.local_classes[idx], dtype=np.int64)
+        arr = torch.from_numpy(np.transpose(arr, [2, 0, 1]))
+        return arr, out_dict, path
 
 class ImageDataset(Dataset):
     def __init__(

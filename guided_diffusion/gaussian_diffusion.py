@@ -136,7 +136,7 @@ class GaussianDiffusion:
         assert (betas > 0).all() and (betas <= 1).all()
 
         self.num_timesteps = int(betas.shape[0])
-
+        print("self.num_timesteps",self.num_timesteps)
         alphas = 1.0 - betas
         self.alphas_cumprod = np.cumprod(alphas, axis=0)
         self.alphas_cumprod_prev = np.append(1.0, self.alphas_cumprod[:-1])
@@ -230,7 +230,7 @@ class GaussianDiffusion:
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def p_mean_variance(
-        self, model, x, t, clip_denoised=True, denoised_fn=None, model_kwargs=None
+        self, model, x, t, clip_denoised=True, denoised_fn=None, model_kwargs=None , unet_output = None
     ):
         """
         Apply the model to get p(x_{t-1} | x_t), as well as a prediction of
@@ -257,7 +257,10 @@ class GaussianDiffusion:
 
         B, C = x.shape[:2]
         assert t.shape == (B,)
-        model_output = model(x, self._scale_timesteps(t), **model_kwargs)
+        if unet_output is None:
+            model_output = model(x, self._scale_timesteps(t), **model_kwargs)
+        else :
+            model_output = unet_output
 
         if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
             assert model_output.shape == (B, C * 2, *x.shape[2:])
@@ -324,6 +327,22 @@ class GaussianDiffusion:
             "log_variance": model_log_variance,
             "pred_xstart": pred_xstart,
         }
+    
+    def get_unet_middle_output(self , model , input , t , model_kawargs):
+        B , C = input.shape[:2]
+        ts = th.tensor([t] * input.shape[0]).to(input.device)
+        assert ts.shape == (B,)
+        unet_latent = model.middle_stage(input , self._scale_timesteps(ts) , **model_kawargs)
+        return unet_latent
+    
+    def get_unet_output_from_middle(self , model , latent):
+        h , hs , emb = latent
+        out = model.output_by_middle(h , hs , emb)
+
+        "======================"
+        "======================"
+
+        return out
 
     def _predict_xstart_from_eps(self, x_t, t, eps):
         assert x_t.shape == eps.shape
@@ -544,6 +563,7 @@ class GaussianDiffusion:
         cond_fn=None,
         model_kwargs=None,
         eta=0.0,
+        unet_output = None
     ):
         """
         Sample x_{t-1} from the model using DDIM.
@@ -557,6 +577,7 @@ class GaussianDiffusion:
             clip_denoised=clip_denoised,
             denoised_fn=denoised_fn,
             model_kwargs=model_kwargs,
+            unet_output=unet_output
         )
         if cond_fn is not None:
             out = self.condition_score(cond_fn, out, x, t, model_kwargs=model_kwargs)
@@ -578,11 +599,52 @@ class GaussianDiffusion:
             out["pred_xstart"] * th.sqrt(alpha_bar_prev)
             + th.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps
         )
+
+        # 保存 eps 和 th.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps 的结果
+        saved_eps = eps
+        saved_adjusted_eps = th.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps
+
         nonzero_mask = (
             (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
         )  # no noise when t == 0
         sample = mean_pred + nonzero_mask * sigma * noise
-        return {"sample": sample, "pred_xstart": out["pred_xstart"]}
+        #return {"sample": sample, "pred_xstart": out["pred_xstart"]}
+        return {
+        "sample": sample,
+        "pred_xstart": out["pred_xstart"],
+        "eps": saved_eps,
+        "adjusted_eps": saved_adjusted_eps
+        }
+
+    def gen_x_minus_one_by_latent(self , model ,last_noise , shape , time_step , latent , clip_denoised , model_kwargs , eta , device):
+        t = th.tensor([time_step] * shape[0],device=device)
+        with th.no_grad():
+            out = self.ddim_sample(
+                model ,
+                last_noise,
+                t,
+                clip_denoised=clip_denoised,
+                denoised_fn = None ,#None for temporary
+                cond_fn = None,
+                model_kwargs=model_kwargs,
+                eta = eta,
+                unet_output=latent
+            )
+            return out["sample"]
+
+    def get_noised_img_from_middle(self , model , middle_latent , last_noise, shape , t , clip_denoised,model_kwargs,eta,device):
+        unet_output = self.get_unet_output_from_middle(model=model,latent=middle_latent)
+        middle_noise = self.gen_x_minus_one_by_latent(model=model,
+                                                      last_noise=last_noise,
+                                                      shape=shape,
+                                                      time_step=t,
+                                                      latent=unet_output,
+                                                      clip_denoised=clip_denoised,
+                                                      model_kwargs=model_kwargs,
+                                                      eta=eta,
+                                                      device=device
+                                                      )
+        return middle_noise
 
     def ddim_reverse_sample(
         self,
@@ -634,13 +696,22 @@ class GaussianDiffusion:
         device=None,
         progress=False,
         eta=0.0,
+        return_intermediate=False,
+        real_step=0,
+        step_range=None,
     ):
         """
         Generate samples from the model using DDIM.
 
         Same usage as p_sample_loop().
         """
-        final = None
+        final = []
+        # 获取保存的 eps 和 adjusted_eps 列表
+        eps_list, adjusted_eps_list = [], []
+
+        if return_intermediate:
+            step = int(self.num_timesteps//100) if self.num_timesteps>100 else 1
+            i = 0
         for sample in self.ddim_sample_loop_progressive(
             model,
             shape,
@@ -652,9 +723,21 @@ class GaussianDiffusion:
             device=device,
             progress=progress,
             eta=eta,
+            real_step=real_step,
+            step_range=step_range
         ):
-            final = sample
-        return final["sample"]
+            # 保存每一步的 eps 和 adjusted_eps
+            eps_list.append(sample["eps"])
+            adjusted_eps_list.append(sample["adjusted_eps"])
+            
+            if return_intermediate:
+                i = i+1
+                if i % step==0:
+                    final.append(sample["sample"])
+            else:
+                final = sample["sample"]
+        #return final    
+        return final, eps_list, adjusted_eps_list# 返回最终生成的样本，同时返回 eps 和 adjusted_eps
 
     def ddim_sample_loop_progressive(
         self,
@@ -668,6 +751,8 @@ class GaussianDiffusion:
         device=None,
         progress=False,
         eta=0.0,
+        real_step=0,
+        step_range = None
     ):
         """
         Use DDIM to sample from the model and yield intermediate samples from
@@ -682,7 +767,115 @@ class GaussianDiffusion:
             img = noise
         else:
             img = th.randn(*shape, device=device)
-        indices = list(range(self.num_timesteps))[::-1]
+
+
+        # 用来保存 eps 和 adjusted_eps 的列表
+        eps_list = []
+        adjusted_eps_list = []
+
+        indices = list(range(self.num_timesteps))[::-1] if not real_step else list(range(self.num_timesteps))[:real_step][::-1]
+        if step_range is not None:
+            indices = list(range(step_range[0] , step_range[1]))[::-1] if not real_step else list(range(self.num_timesteps))[:real_step][::-1]
+            # make ddim process more flexible with specified time_step
+
+        if progress:
+            # Lazy import so that we don't depend on tqdm.
+            from tqdm.auto import tqdm
+
+            indices = tqdm(indices)
+
+        for i in indices:
+            print(f"ddim sample time_step = {i}")
+            t = th.tensor([i] * shape[0], device=device)
+            with th.no_grad():
+                out = self.ddim_sample(
+                    model,
+                    img,
+                    t,
+                    clip_denoised=clip_denoised,
+                    denoised_fn=denoised_fn,
+                    cond_fn=cond_fn,
+                    model_kwargs=model_kwargs,
+                    eta=eta,
+                )
+                # 保存 eps 和 adjusted_eps
+                eps_list.append(out["eps"])
+                adjusted_eps_list.append(out["adjusted_eps"])
+                yield out
+                img = out["sample"]
+        # 返回 eps 和 adjusted_eps 列表以供后续分析
+        return eps_list, adjusted_eps_list
+
+    def get_ddim_sample_total_loops(self):
+
+        return self.num_timesteps
+
+    def ddim_reverse_sample_loop(
+        self,
+        model,
+        shape,
+        noise=None,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        device=None,
+        progress=False,
+        eta=0.0,
+        real_step=0,
+    ):
+        """
+        Generate samples from the model using DDIM.
+
+        Same usage as p_sample_loop().
+        """
+        final = None
+        final_rec = []
+        for sample in self.ddim_reverse_sample_loop_progressive(
+            model,
+            shape,
+            noise=noise,
+            clip_denoised=clip_denoised,
+            denoised_fn=denoised_fn,
+            cond_fn=cond_fn,
+            model_kwargs=model_kwargs,
+            device=device,
+            progress=progress,
+            eta=eta,
+            real_step=real_step,
+        ):
+            final = sample
+        return final["sample"]
+
+    def ddim_reverse_sample_loop_progressive(
+        self,
+        model,
+        shape,
+        noise=None,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        device=None,
+        progress=False,
+        eta=0.0,
+        real_step=0
+    ):
+        """
+        Use DDIM to sample from the model and yield intermediate samples from
+        each timestep of DDIM.
+
+        Same usage as p_sample_loop_progressive().
+        """
+        if device is None:
+            device = next(model.parameters()).device
+        assert isinstance(shape, (tuple, list))
+        if noise is not None:
+            img = noise
+        else:
+            img = th.randn(*shape, device=device)
+        # print(real_step, type(real_step))
+        indices = list(range(self.num_timesteps)) if real_step==0 else list(range(self.num_timesteps))[:real_step]#[::-1] # 1, ..., T
 
         if progress:
             # Lazy import so that we don't depend on tqdm.
@@ -693,13 +886,12 @@ class GaussianDiffusion:
         for i in indices:
             t = th.tensor([i] * shape[0], device=device)
             with th.no_grad():
-                out = self.ddim_sample(
+                out = self.ddim_reverse_sample(
                     model,
                     img,
                     t,
                     clip_denoised=clip_denoised,
                     denoised_fn=denoised_fn,
-                    cond_fn=cond_fn,
                     model_kwargs=model_kwargs,
                     eta=eta,
                 )

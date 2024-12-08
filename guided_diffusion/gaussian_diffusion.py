@@ -332,16 +332,12 @@ class GaussianDiffusion:
         B , C = input.shape[:2]
         ts = th.tensor([t] * input.shape[0]).to(input.device)
         assert ts.shape == (B,)
-        unet_latent = model.middle_stage(input , self._scale_timesteps(ts) , **model_kawargs)
+        unet_latent = self.get_wrap_model(model).gen_middle_unet(input = input ,ts = self._scale_timesteps(ts) , model_kawargs = model_kawargs)
         return unet_latent
     
     def get_unet_output_from_middle(self , model , latent):
         h , hs , emb = latent
         out = model.output_by_middle(h , hs , emb)
-
-        "======================"
-        "======================"
-
         return out
 
     def _predict_xstart_from_eps(self, x_t, t, eps):
@@ -699,6 +695,7 @@ class GaussianDiffusion:
         return_intermediate=False,
         real_step=0,
         step_range=None,
+        test=False
     ):
         """
         Generate samples from the model using DDIM.
@@ -724,7 +721,8 @@ class GaussianDiffusion:
             progress=progress,
             eta=eta,
             real_step=real_step,
-            step_range=step_range
+            step_range=step_range,
+            diff_sample=test
         ):
             # 保存每一步的 eps 和 adjusted_eps
             eps_list.append(sample["eps"])
@@ -752,7 +750,8 @@ class GaussianDiffusion:
         progress=False,
         eta=0.0,
         real_step=0,
-        step_range = None
+        step_range = None,
+        diff_sample = False
     ):
         """
         Use DDIM to sample from the model and yield intermediate samples from
@@ -845,7 +844,8 @@ class GaussianDiffusion:
             real_step=real_step,
         ):
             final = sample
-        return final["sample"]
+            final_rec.append(sample["sample"])
+        return final["sample"] , final_rec
 
     def ddim_reverse_sample_loop_progressive(
         self,

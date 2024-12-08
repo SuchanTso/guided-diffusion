@@ -111,6 +111,9 @@ class SpacedDiffusion(GaussianDiffusion):
     def _scale_timesteps(self, t):
         # Scaling is done by the wrapped model.
         return t
+    
+    def get_wrap_model(self , model):
+        return self._wrap_model(model)
 
 
 class _WrappedModel:
@@ -126,3 +129,15 @@ class _WrappedModel:
         if self.rescale_timesteps:
             new_ts = new_ts.float() * (1000.0 / self.original_num_steps)
         return self.model(x, new_ts, **kwargs)
+
+    def gen_middle_unet(self , input , ts , model_kawargs):
+        map_tensor = th.tensor(self.timestep_map, device=ts.device, dtype=ts.dtype)
+        new_ts = map_tensor[ts]
+        if self.rescale_timesteps:
+            new_ts = new_ts.float() * (1000.0 / self.original_num_steps)
+
+        middle_stage = self.model.middle_stage(input , new_ts , model_kawargs)
+        return middle_stage
+    
+    def get_unet_output_by_middle(self , h , hs , emb):
+        return self.model.output_by_middle(h , hs , emb)

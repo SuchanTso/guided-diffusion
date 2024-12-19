@@ -221,17 +221,38 @@ class ResBlock(TimestepBlock):
         else:
             self.skip_connection = conv_nd(dims, channels, self.out_channels, 1)
 
-    def forward(self, x, emb):
-        """
-        Apply the block to a Tensor, conditioned on a timestep embedding.
+    # def forward(self, x, emb):
+    #     """
+    #     Apply the block to a Tensor, conditioned on a timestep embedding.
 
-        :param x: an [N x C x ...] Tensor of features.
-        :param emb: an [N x emb_channels] Tensor of timestep embeddings.
-        :return: an [N x C x ...] Tensor of outputs.
-        """
-        return checkpoint(
-            self._forward, (x, emb), self.parameters(), self.use_checkpoint
-        )
+    #     :param x: an [N x C x ...] Tensor of features.
+    #     :param emb: an [N x emb_channels] Tensor of timestep embeddings.
+    #     :return: an [N x C x ...] Tensor of outputs.
+    #     """
+    #     return checkpoint(
+    #         self._forward, (x, emb), self.parameters(), self.use_checkpoint
+    #     )
+    def forward(self, x, emb):
+        if self.updown:
+            in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
+            h = in_rest(x)
+            h = self.h_upd(h)
+            x = self.x_upd(x)
+            h = in_conv(h)
+        else:
+            h = self.in_layers(x)
+        emb_out = self.emb_layers(emb).type(h.dtype)
+        while len(emb_out.shape) < len(h.shape):
+            emb_out = emb_out[..., None]
+        if self.use_scale_shift_norm:
+            out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
+            scale, shift = th.chunk(emb_out, 2, dim=1)
+            h = out_norm(h) * (1 + scale) + shift
+            h = out_rest(h)
+        else:
+            h = h + emb_out
+            h = self.out_layers(h)
+        return self.skip_connection(x) + h
 
     def _forward(self, x, emb):
         if self.updown:
@@ -294,7 +315,12 @@ class AttentionBlock(nn.Module):
         self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
 
     def forward(self, x):
-        return checkpoint(self._forward, (x,), self.parameters(), True)
+        b, c, *spatial = x.shape
+        x = x.reshape(b, c, -1)
+        qkv = self.qkv(self.norm(x))
+        h = self.attention(qkv)
+        h = self.proj_out(h)
+        return (x + h).reshape(b, c, *spatial)
 
     def _forward(self, x):
         b, c, *spatial = x.shape
@@ -706,6 +732,16 @@ class UNetModel(nn.Module):
         assert self.x_type is not None , "need a specified x.dtype , when forward, is torch.float32"
         h = h.type(self.x_type)
         return self.out(h)
+    
+    def output_by_middle_step(self , h , hs , emb):
+        h_rec = []
+        for module in self.output_blocks:
+            h = th.cat([h, hs.pop()], dim=1)
+            h = module(h, emb)
+            h_rec.append(h)
+        assert self.x_type is not None , "need a specified x.dtype , when forward, is torch.float32"
+        h = h.type(self.x_type)
+        return h_rec
         
 
 

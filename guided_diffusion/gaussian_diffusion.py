@@ -339,6 +339,11 @@ class GaussianDiffusion:
         h , hs , emb = latent
         out = model.output_by_middle(h , hs , emb)
         return out
+    
+    def get_unet_output_step_by_step(self , model , latent):
+        h , hs , emb = latent
+        out = model.output_by_middle_step(h , hs , emb)
+        return out
 
     def _predict_xstart_from_eps(self, x_t, t, eps):
         assert x_t.shape == eps.shape

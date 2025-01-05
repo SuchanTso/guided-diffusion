@@ -76,6 +76,14 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
             else:
                 x = layer(x)
         return x
+    
+    def extract_feature(self , x, emb):
+        for layer in self:
+            if isinstance(layer, TimestepBlock):
+                x , feature = layer.mid_visual(x, emb)
+            else:
+                x , feature = layer.mid_visual(x)
+        return x , feature
 
 
 class Upsample(nn.Module):
@@ -253,8 +261,8 @@ class ResBlock(TimestepBlock):
             h = h + emb_out
             h = self.out_layers(h)
         return self.skip_connection(x) + h
-
-    def _forward(self, x, emb):
+    
+    def mid_visual(self, x, emb):
         if self.updown:
             in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
             h = in_rest(x)
@@ -274,7 +282,29 @@ class ResBlock(TimestepBlock):
         else:
             h = h + emb_out
             h = self.out_layers(h)
-        return self.skip_connection(x) + h
+        return self.skip_connection(x) + h , h
+
+    # def _forward(self, x, emb):
+    #     if self.updown:
+    #         in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
+    #         h = in_rest(x)
+    #         h = self.h_upd(h)
+    #         x = self.x_upd(x)
+    #         h = in_conv(h)
+    #     else:
+    #         h = self.in_layers(x)
+    #     emb_out = self.emb_layers(emb).type(h.dtype)
+    #     while len(emb_out.shape) < len(h.shape):
+    #         emb_out = emb_out[..., None]
+    #     if self.use_scale_shift_norm:
+    #         out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
+    #         scale, shift = th.chunk(emb_out, 2, dim=1)
+    #         h = out_norm(h) * (1 + scale) + shift
+    #         h = out_rest(h)
+    #     else:
+    #         h = h + emb_out
+    #         h = self.out_layers(h)
+    #     return self.skip_connection(x) + h
 
 
 class AttentionBlock(nn.Module):
@@ -321,6 +351,15 @@ class AttentionBlock(nn.Module):
         h = self.attention(qkv)
         h = self.proj_out(h)
         return (x + h).reshape(b, c, *spatial)
+    
+    def mid_visual(self, x):
+        b, c, *spatial = x.shape
+        x = x.reshape(b, c, -1)
+        qkv = self.qkv(self.norm(x))
+        att_h = self.attention(qkv)
+        h = self.proj_out(att_h)
+        return (x + h).reshape(b, c, *spatial) , h.reshape(b, c, *spatial)
+
 
     def _forward(self, x):
         b, c, *spatial = x.shape
@@ -743,6 +782,48 @@ class UNetModel(nn.Module):
         h = h.type(self.x_type)
         return h_rec
         
+    def get_decoder_layer(self, x, timesteps, y=None):
+        """
+        Apply the model to an input batch.
+
+        :param x: an [N x C x ...] Tensor of inputs.
+        :param timesteps: a 1-D batch of timesteps.
+        :param y: an [N] Tensor of labels, if class-conditional.
+        :return: an [N x C x ...] Tensor of outputs.
+        """
+        assert (y is not None) == (
+            self.num_classes is not None
+        ), "must specify y if and only if the model is class-conditional"
+        h_rec = []
+        hs = []
+        emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
+
+        if self.num_classes is not None:
+            assert y.shape == (x.shape[0],)
+            emb = emb + self.label_emb(y)
+
+        h = x.type(self.dtype)
+        for module in self.input_blocks:
+            h = module(h, emb)
+            hs.append(h)
+        # print(f"in unet input stage , h.shape = {h.shape}")
+        h = self.middle_block(h, emb)
+        h_rec.append(h)
+        # print(f"in unet middle stage , h.shape = {h.shape}")
+        for i , module in enumerate(self.output_blocks):
+            h = th.cat([h, hs.pop()], dim=1)
+            h , feature = module.extract_feature(h, emb)
+            h_rec.append(feature)
+            # print(f"module_{i+2}:{module}")
+        h = h.type(x.dtype)
+        if self.x_type is None:
+            self.x_type = x.dtype
+        # print(f"in unet out stage , h.shape = {h.shape}")
+        out = self.out(h)
+        h_rec.append(out)
+        # print(f"in unet final stage , h.shape = {out.shape}")
+
+        return h_rec
 
 
 class SuperResModel(UNetModel):

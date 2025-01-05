@@ -230,7 +230,7 @@ class GaussianDiffusion:
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def p_mean_variance(
-        self, model, x, t, clip_denoised=True, denoised_fn=None, model_kwargs=None , unet_output = None
+        self, model, x, t, clip_denoised=True, denoised_fn=None, model_kwargs=None , unet_output = None , get_layer_output=False
     ):
         """
         Apply the model to get p(x_{t-1} | x_t), as well as a prediction of
@@ -261,6 +261,10 @@ class GaussianDiffusion:
             model_output = model(x, self._scale_timesteps(t), **model_kwargs)
         else :
             model_output = unet_output
+
+        layer_rec = None
+        if get_layer_output:
+            layer_rec = model.get_decoder_layer(x, self._scale_timesteps(t), **model_kwargs)
 
         if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
             assert model_output.shape == (B, C * 2, *x.shape[2:])
@@ -326,6 +330,7 @@ class GaussianDiffusion:
             "variance": model_variance,
             "log_variance": model_log_variance,
             "pred_xstart": pred_xstart,
+            "layer_record":layer_rec
         }
     
     def get_unet_middle_output(self , model , input , t , model_kawargs):
@@ -564,7 +569,8 @@ class GaussianDiffusion:
         cond_fn=None,
         model_kwargs=None,
         eta=0.0,
-        unet_output = None
+        unet_output = None,
+        get_layer_record = False
     ):
         """
         Sample x_{t-1} from the model using DDIM.
@@ -578,7 +584,8 @@ class GaussianDiffusion:
             clip_denoised=clip_denoised,
             denoised_fn=denoised_fn,
             model_kwargs=model_kwargs,
-            unet_output=unet_output
+            unet_output=unet_output,
+            get_layer_output=get_layer_record
         )
         if cond_fn is not None:
             out = self.condition_score(cond_fn, out, x, t, model_kwargs=model_kwargs)
@@ -614,7 +621,8 @@ class GaussianDiffusion:
         "sample": sample,
         "pred_xstart": out["pred_xstart"],
         "eps": saved_eps,
-        "adjusted_eps": saved_adjusted_eps
+        "adjusted_eps": saved_adjusted_eps,
+        "layer_record":out["layer_record"]
         }
 
     def gen_x_minus_one_by_latent(self , model ,last_noise , shape , time_step , latent , clip_denoised , model_kwargs , eta , device):
@@ -700,7 +708,7 @@ class GaussianDiffusion:
         return_intermediate=False,
         real_step=0,
         step_range=None,
-        test=False
+        record_ratio = -1.0
     ):
         """
         Generate samples from the model using DDIM.
@@ -714,6 +722,8 @@ class GaussianDiffusion:
         if return_intermediate:
             step = int(self.num_timesteps//100) if self.num_timesteps>100 else 1
             i = 0
+
+        layer_record = None
         for sample in self.ddim_sample_loop_progressive(
             model,
             shape,
@@ -727,7 +737,7 @@ class GaussianDiffusion:
             eta=eta,
             real_step=real_step,
             step_range=step_range,
-            diff_sample=test
+            record_ratio=record_ratio# record step means how far we go from the origin step . eg. 1.0 means the farthest , aka x_0
         ):
             # 保存每一步的 eps 和 adjusted_eps
             eps_list.append(sample["eps"])
@@ -739,7 +749,13 @@ class GaussianDiffusion:
                     final.append(sample["sample"])
             else:
                 final = sample["sample"]
+
+            if sample["layer_record"]:
+                layer_record = sample["layer_record"]
+
         #return final    
+        if layer_record:
+            return final, eps_list, adjusted_eps_list , layer_record
         return final, eps_list, adjusted_eps_list# 返回最终生成的样本，同时返回 eps 和 adjusted_eps
 
     def ddim_sample_loop_progressive(
@@ -756,7 +772,7 @@ class GaussianDiffusion:
         eta=0.0,
         real_step=0,
         step_range = None,
-        diff_sample = False
+        record_ratio = -1.0
     ):
         """
         Use DDIM to sample from the model and yield intermediate samples from
@@ -776,6 +792,8 @@ class GaussianDiffusion:
         # 用来保存 eps 和 adjusted_eps 的列表
         eps_list = []
         adjusted_eps_list = []
+
+        layer_record_step = -1 if (record_ratio < 0 or record_ratio > 1.0) else self.num_timesteps * record_ratio
 
         indices = list(range(self.num_timesteps))[::-1] if not real_step else list(range(self.num_timesteps))[:real_step][::-1]
         if step_range is not None:
@@ -801,6 +819,7 @@ class GaussianDiffusion:
                     cond_fn=cond_fn,
                     model_kwargs=model_kwargs,
                     eta=eta,
+                    get_layer_record=layer_record_step > 0 and i == layer_record_step
                 )
                 # 保存 eps 和 adjusted_eps
                 eps_list.append(out["eps"])
@@ -808,7 +827,7 @@ class GaussianDiffusion:
                 yield out
                 img = out["sample"]
         # 返回 eps 和 adjusted_eps 列表以供后续分析
-        return eps_list, adjusted_eps_list
+        return eps_list, adjusted_eps_list , out["layer_record"]
 
     def get_ddim_sample_total_loops(self):
 

@@ -141,3 +141,10 @@ class _WrappedModel:
     
     def get_unet_output_by_middle(self , h , hs , emb):
         return self.model.output_by_middle(h , hs , emb)
+    
+    def get_decoder_layer(self, x, ts, y=None):
+        map_tensor = th.tensor(self.timestep_map, device=ts.device, dtype=ts.dtype)
+        new_ts = map_tensor[ts]
+        if self.rescale_timesteps:
+            new_ts = new_ts.float() * (1000.0 / self.original_num_steps)
+        return self.model.get_decoder_layer(x , new_ts , y)
